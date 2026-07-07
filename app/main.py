@@ -15,6 +15,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 import streamlit as st
 
 from sec_analyzer.cache.sqlite_cache import SQLiteCache
+from sec_analyzer.comparison import compare
 from sec_analyzer.gateway import get_gateway
 from sec_analyzer.orchestration.graph import build_pipeline, initial_state
 from sec_analyzer.trends import fetch_trends
@@ -144,6 +145,33 @@ def _run_trends(ticker: str, years: int) -> list:
         return pool.submit(_in_thread).result()
 
 
+# ── Comparison runner ────────────────────────────────────────────────────────
+
+def _run_comparison(tickers: list[str]):
+    """Run parallel comparison pipeline in a fresh thread+event loop."""
+    import concurrent.futures
+    from langfuse import Langfuse
+
+    def _in_thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def _run():
+                async with SQLiteCache() as cache:
+                    langfuse = Langfuse(
+                        public_key=os.environ["LANGFUSE_PUBLIC_KEY"],
+                        secret_key=os.environ["LANGFUSE_SECRET_KEY"],
+                        host=os.environ.get("LANGFUSE_HOST", "http://localhost:3000"),
+                    )
+                    return await compare(tickers, cache, langfuse)
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(_in_thread).result()
+
+
 # ── Chat Q&A helper ───────────────────────────────────────────────────────────
 
 def _answer_question(question: str, report: str) -> str:
@@ -173,7 +201,7 @@ def _answer_question(question: str, report: str) -> str:
 
 import json
 
-tab_analysis, tab_trends = st.tabs(["📄 Analysis", "📈 Trends"])
+tab_analysis, tab_trends, tab_compare = st.tabs(["📄 Analysis", "📈 Trends", "⚖️ Compare"])
 
 # ── Tab 1: Analysis + chat ────────────────────────────────────────────────────
 
@@ -297,3 +325,99 @@ with tab_trends:
                         st.caption(_CHART_METRICS[metric])
                         st.line_chart(df[[metric]].rename(columns={metric: _CHART_METRICS[metric]}))
 
+# ── Tab 3: Multi-company comparison ──────────────────────────────────────────
+
+with tab_compare:
+    st.subheader("Compare companies side-by-side")
+    st.caption("Enter 2–4 ticker symbols to generate a comparative analysis.")
+
+    compare_input = st.text_input(
+        "Tickers (comma-separated)",
+        placeholder="e.g. UBER, LYFT  or  AAPL, MSFT, GOOGL",
+        key="compare_tickers",
+    )
+    compare_btn = st.button("Compare", type="primary", key="compare_btn")
+
+    if compare_btn:
+        raw_tickers = [t.strip().upper() for t in compare_input.split(",") if t.strip()]
+        if len(raw_tickers) < 2:
+            st.warning("Enter at least 2 ticker symbols separated by commas.")
+        elif len(raw_tickers) > 4:
+            st.warning("Maximum 4 tickers at once.")
+        else:
+            with st.spinner(f"Analysing {', '.join(raw_tickers)} in parallel…"):
+                try:
+                    result = _run_comparison(raw_tickers)
+                except Exception as e:
+                    st.error(f"Comparison failed: {e}")
+                    st.stop()
+
+            # ── Side-by-side metrics table ────────────────────────────────
+            st.divider()
+            st.subheader("Key metrics")
+
+            import pandas as pd
+
+            _CMP_METRICS = {
+                "revenue":             "Revenue ($M)",
+                "gross_profit":        "Gross Profit ($M)",
+                "operating_income":    "Operating Income ($M)",
+                "net_income":          "Net Income ($M)",
+                "eps_diluted":         "Diluted EPS ($)",
+                "total_assets":        "Total Assets ($M)",
+                "total_equity":        "Total Equity ($M)",
+                "cash_and_equivalents":"Cash & Equiv ($M)",
+            }
+
+            rows = {}
+            for label in _CMP_METRICS.values():
+                rows[label] = {}
+            for extraction in result.extractions:
+                fy = extraction.metrics.get("fiscal_year_end") or extraction.filed_date
+                col_name = f"{extraction.ticker}\n(FY {fy})"
+                for key, label in _CMP_METRICS.items():
+                    val = extraction.metrics.get(key)
+                    if val is None:
+                        rows[label][col_name] = None
+                    elif key == "eps_diluted":
+                        rows[label][col_name] = round(val, 2)
+                    else:
+                        rows[label][col_name] = round(val, 0)
+
+            df_cmp = pd.DataFrame(rows).T
+            st.dataframe(
+                df_cmp.style.format(
+                    lambda v: f"{v:,.1f}" if isinstance(v, float) and abs(v) >= 10
+                    else (f"{v:.2f}" if isinstance(v, float) else ("—" if v is None else str(v)))
+                ),
+                use_container_width=True,
+            )
+
+            # ── Bar charts ────────────────────────────────────────────────
+            st.divider()
+            st.subheader("Visual comparison")
+
+            bar_metrics = [
+                ("revenue", "Revenue ($M)"),
+                ("net_income", "Net Income ($M)"),
+                ("eps_diluted", "Diluted EPS ($)"),
+                ("total_assets", "Total Assets ($M)"),
+            ]
+            bar_cols = st.columns(2)
+            for i, (key, label) in enumerate(bar_metrics):
+                chart_data = {
+                    e.ticker: e.metrics.get(key)
+                    for e in result.extractions
+                    if e.metrics.get(key) is not None
+                }
+                if chart_data:
+                    with bar_cols[i % 2]:
+                        st.caption(label)
+                        st.bar_chart(pd.DataFrame.from_dict(
+                            {"Value": chart_data}
+                        ))
+
+            # ── Comparative report ────────────────────────────────────────
+            st.divider()
+            st.subheader("Comparative analysis")
+            st.markdown(result.report)

@@ -9,6 +9,7 @@ build/
 .ruff_cache/
 .mypy_cache/
 .DS_Store
+.claude/
 *.db
 *.db-journal
 *.swp

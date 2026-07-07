@@ -8,6 +8,7 @@ import pytest
 
 from sec_analyzer.agents.extractor import (
     ExtractedData,
+    _format_metrics_for_prompt,
     _html_to_text,
     _parse_metrics,
     _split_sections,
@@ -165,3 +166,115 @@ async def test_extract_falls_back_gracefully_on_bad_llm_output():
 
     assert result.ticker == "MSFT"
     assert isinstance(result.metrics, dict)  # empty or partial, but no crash
+
+
+# ── _format_metrics_for_prompt ────────────────────────────────────────────────
+
+def test_format_metrics_includes_revenue_in_millions():
+    out = _format_metrics_for_prompt({"revenue": 52017.0}, "2025-12-31")
+    assert "$52,017M" in out
+
+
+def test_format_metrics_eps_shows_two_decimal_places():
+    out = _format_metrics_for_prompt({"eps_diluted": 4.73}, "2025-12-31")
+    assert "$4.73" in out
+
+
+def test_format_metrics_skips_missing_keys():
+    out = _format_metrics_for_prompt({"revenue": 52017.0}, "2025-12-31")
+    assert "Net Income" not in out
+
+
+def test_format_metrics_empty_returns_placeholder():
+    out = _format_metrics_for_prompt({}, "2025-12-31")
+    assert "no verified metrics" in out
+
+
+# ── extract with xbrl_metrics ─────────────────────────────────────────────────
+
+_XBRL_METRICS = {
+    "revenue": 52017.0,
+    "net_income": 10053.0,
+    "eps_diluted": 4.73,
+    "total_assets": 61802.0,
+    "fiscal_year_end": "2025-12-31",
+}
+
+
+async def test_extract_uses_xbrl_metrics_when_provided():
+    """When xbrl_metrics are passed, they should be used directly without HTML parsing."""
+    lf = _make_langfuse_mock()
+    trace_ctx = MagicMock()
+
+    fake_response = ModelResponse(
+        text="Uber grew revenue significantly in FY2025.",
+        model="qwen2.5:7b",
+        input_tokens=300,
+        output_tokens=60,
+    )
+    gw = AsyncMock()
+    gw.complete = AsyncMock(return_value=fake_response)
+
+    result = await extract(
+        ticker="UBER",
+        filed_date="2026-02-13",
+        document_text=_FAKE_10K,
+        langfuse=lf,
+        trace_context=trace_ctx,
+        gateway=gw,
+        xbrl_metrics=_XBRL_METRICS,
+    )
+
+    # XBRL values should be used directly
+    assert result.metrics["revenue"] == 52017.0
+    assert result.metrics["net_income"] == 10053.0
+    assert result.metrics["eps_diluted"] == 4.73
+
+
+async def test_extract_xbrl_metrics_appear_in_llm_prompt():
+    """Verified XBRL metrics must be injected into the LLM prompt."""
+    lf = _make_langfuse_mock()
+    trace_ctx = MagicMock()
+
+    fake_response = ModelResponse(text="Summary.", model="qwen2.5:7b")
+    gw = AsyncMock()
+    gw.complete = AsyncMock(return_value=fake_response)
+
+    await extract(
+        ticker="UBER",
+        filed_date="2026-02-13",
+        document_text=_FAKE_10K,
+        langfuse=lf,
+        trace_context=trace_ctx,
+        gateway=gw,
+        xbrl_metrics=_XBRL_METRICS,
+    )
+
+    # The user message sent to the LLM should contain the verified metric values
+    call_args = gw.complete.call_args
+    messages = call_args[0][0]
+    user_content = messages[0]["content"]
+    assert "52,017" in user_content   # revenue injected
+    assert "4.73" in user_content     # EPS injected
+
+
+async def test_extract_falls_back_to_html_when_no_xbrl():
+    """Without xbrl_metrics, rule-based HTML table parsing is used."""
+    lf = _make_langfuse_mock()
+    trace_ctx = MagicMock()
+
+    fake_response = ModelResponse(text="Summary.", model="qwen2.5:7b")
+    gw = AsyncMock()
+    gw.complete = AsyncMock(return_value=fake_response)
+
+    result = await extract(
+        ticker="AAPL",
+        filed_date="2024-11-01",
+        document_text=_FAKE_10K_WITH_TABLES,
+        langfuse=lf,
+        trace_context=trace_ctx,
+        gateway=gw,
+        xbrl_metrics=None,  # no XBRL — should fall back to HTML
+    )
+
+    assert result.metrics.get("revenue") == 394328.0
