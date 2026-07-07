@@ -36,13 +36,24 @@ CREATE TABLE IF NOT EXISTS filings (
     filed_date         TEXT NOT NULL,
     document_url       TEXT NOT NULL,
     cached_at          TEXT NOT NULL,
-    PRIMARY KEY (ticker, form_type)
+    PRIMARY KEY (ticker, form_type, accession_number)
 );
+
+CREATE INDEX IF NOT EXISTS filings_ticker_form_date
+    ON filings (ticker, form_type, filed_date DESC);
 
 CREATE TABLE IF NOT EXISTS documents (
     url         TEXT PRIMARY KEY,
     file_path   TEXT NOT NULL,
     cached_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS xbrl_facts (
+    cik            TEXT NOT NULL,
+    fiscal_year    TEXT NOT NULL,
+    facts_json     TEXT NOT NULL,
+    cached_at      TEXT NOT NULL,
+    PRIMARY KEY (cik, fiscal_year)
 );
 """
 
@@ -101,13 +112,16 @@ class SQLiteCache:
     # ── Filing metadata ───────────────────────────────────────────────────────
 
     async def get_filing(self, ticker: str, form_type: str = "10-K") -> CachedFiling | None:
+        """Return the most recently filed cached filing for (ticker, form_type)."""
         assert self._conn
         async with self._conn.execute(
             """SELECT f.ticker, f.cik, f.accession_number, f.form_type,
                       f.filed_date, f.document_url, d.file_path
                FROM filings f
                LEFT JOIN documents d ON d.url = f.document_url
-               WHERE f.ticker = ? AND f.form_type = ?""",
+               WHERE f.ticker = ? AND f.form_type = ?
+               ORDER BY f.filed_date DESC
+               LIMIT 1""",
             (ticker.upper(), form_type),
         ) as cur:
             row = await cur.fetchone()
@@ -127,7 +141,7 @@ class SQLiteCache:
     ) -> None:
         assert self._conn
         await self._conn.execute(
-            """INSERT OR REPLACE INTO filings
+            """INSERT OR IGNORE INTO filings
                (ticker, cik, accession_number, form_type, filed_date,
                 document_url, cached_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -148,6 +162,28 @@ class SQLiteCache:
         ) as cur:
             row = await cur.fetchone()
             return row["file_path"] if row else None
+
+    # ── XBRL facts ────────────────────────────────────────────────────────────
+
+    async def get_xbrl_facts(self, cik: str, fiscal_year: str) -> dict | None:
+        assert self._conn
+        import json as _json
+        async with self._conn.execute(
+            "SELECT facts_json FROM xbrl_facts WHERE cik = ? AND fiscal_year = ?",
+            (cik, fiscal_year),
+        ) as cur:
+            row = await cur.fetchone()
+            return _json.loads(row["facts_json"]) if row else None
+
+    async def store_xbrl_facts(self, cik: str, fiscal_year: str, facts: dict) -> None:
+        assert self._conn
+        import json as _json
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO xbrl_facts (cik, fiscal_year, facts_json, cached_at)
+               VALUES (?, ?, ?, ?)""",
+            (cik, fiscal_year, _json.dumps(facts), _now()),
+        )
+        await self._conn.commit()
 
     def document_path_for(self, url: str) -> Path:
         """Return a deterministic filesystem path for caching a URL."""

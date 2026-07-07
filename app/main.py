@@ -30,6 +30,13 @@ st.set_page_config(
 st.title("📊 VeriAnalyst")
 st.caption("SEC 10-K analysis powered by AI")
 
+
+def _fmt_millions(value: float) -> str:
+    """Format a value stored in millions as $XB or $XM."""
+    if abs(value) >= 1_000:
+        return f"${value / 1_000:.2f}B"
+    return f"${value:,.0f}M"
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 if "messages" not in st.session_state:
@@ -62,13 +69,13 @@ with st.sidebar:
         st.subheader("Key metrics")
         m = st.session_state.metrics
         if "revenue" in m:
-            st.metric("Revenue", f"${m['revenue']:,.0f}M")
+            st.metric("Revenue", _fmt_millions(m['revenue']))
         if "net_income" in m:
-            st.metric("Net income", f"${m['net_income']:,.0f}M")
+            st.metric("Net income", _fmt_millions(m['net_income']))
         if "eps_diluted" in m:
             st.metric("Diluted EPS", f"${m['eps_diluted']:.2f}")
         if "total_assets" in m:
-            st.metric("Total assets", f"${m['total_assets']:,.0f}M")
+            st.metric("Total assets", _fmt_millions(m['total_assets']))
         if "fiscal_year_end" in m:
             st.caption(f"Fiscal year end: {m['fiscal_year_end']}")
 

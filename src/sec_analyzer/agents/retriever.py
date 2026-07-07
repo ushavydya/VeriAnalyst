@@ -16,6 +16,7 @@ from langfuse import Langfuse
 from langfuse.types import TraceContext
 
 from sec_analyzer.cache.sqlite_cache import CachedFiling, SQLiteCache
+from sec_analyzer.xbrl import download_xbrl_facts, fetch_xbrl_facts
 
 _EDGAR_BASE = "https://data.sec.gov"
 _EDGAR_ARCHIVES = "https://www.sec.gov/Archives/edgar/data"
@@ -32,6 +33,7 @@ class FilingResult:
     document_url: str
     document_path: Path
     cache_hit: bool
+    xbrl_metrics: dict[str, float] | None = None  # None = not yet fetched
 
     def read_text(self) -> str:
         return self.document_path.read_text(encoding="utf-8", errors="replace")
@@ -82,7 +84,40 @@ class SECRetriever:
             "Host": "data.sec.gov",
         }
 
+    @property
+    def _data_headers(self) -> dict[str, str]:
+        return {**self._headers, "Host": "data.sec.gov"}
+
     # ── Public ────────────────────────────────────────────────────────────────
+
+    async def fetch_xbrl(
+        self,
+        cik: str,
+        fiscal_year: str | None,
+        trace_context: TraceContext,
+    ) -> dict[str, float]:
+        """Return XBRL-sourced metrics for *cik* and *fiscal_year* (YYYY).
+
+        Caches the raw company facts JSON so subsequent calls for the same CIK
+        (different fiscal years) hit the cache without another HTTP request.
+        """
+        with self._lf.start_as_current_observation(
+            name="retriever.xbrl",
+            as_type="span",
+            trace_context=trace_context,
+            input={"cik": cik, "fiscal_year": fiscal_year},
+        ) as span:
+            raw = await self._cache.get_xbrl_facts(cik, "raw")
+            if raw is None:
+                raw = await download_xbrl_facts(cik, self._data_headers)
+                await self._cache.store_xbrl_facts(cik, "raw", raw)
+                span.update(output={"source": "edgar"})
+            else:
+                span.update(output={"source": "cache"})
+
+            metrics = fetch_xbrl_facts(cik, fiscal_year, raw=raw)
+            span.update(output={"source": "cache" if raw else "edgar", "metrics_found": list(metrics.keys())})
+        return metrics
 
     async def fetch_10k(
         self,
@@ -100,6 +135,11 @@ class SECRetriever:
         ) as span:
             try:
                 result = await self._fetch(ticker, form_type, trace_context)
+                fiscal_year = result.filed_date[:4]
+                try:
+                    result.xbrl_metrics = await self.fetch_xbrl(result.cik, None, trace_context)
+                except Exception as xbrl_exc:
+                    span.update(output={"xbrl_warning": str(xbrl_exc)})
             except Exception as exc:
                 span.update(
                     output={"error": str(exc)},
@@ -113,6 +153,7 @@ class SECRetriever:
                     "cik": result.cik,
                     "filed_date": result.filed_date,
                     "document_path": str(result.document_path),
+                    "xbrl_metrics": list(result.xbrl_metrics.keys()) if result.xbrl_metrics else [],
                 }
             )
         return result

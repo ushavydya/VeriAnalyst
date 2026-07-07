@@ -28,7 +28,8 @@ class PipelineState(TypedDict):
     filing_content: str | None
     filing_cik: str | None
     filing_date: str | None
-    extracted_data_json: str | None   # JSON-serialised ExtractedData
+    xbrl_metrics: dict | None          # XBRL-verified metrics from retriever
+    extracted_data_json: str | None    # JSON-serialised ExtractedData
     critique_json: str | None
     report: str | None
     error: str | None
@@ -52,6 +53,7 @@ def build_pipeline(cache: SQLiteCache, langfuse: Langfuse) -> "CompiledGraph":
                 "filing_content": result.read_text(),
                 "filing_cik": result.cik,
                 "filing_date": result.filed_date,
+                "xbrl_metrics": result.xbrl_metrics,
                 "cache_hit": result.cache_hit,
                 "error": None,
             }
@@ -70,6 +72,7 @@ def build_pipeline(cache: SQLiteCache, langfuse: Langfuse) -> "CompiledGraph":
             document_text=state["filing_content"],
             langfuse=langfuse,
             trace_context=tc,
+            xbrl_metrics=state.get("xbrl_metrics"),
         )
         return {"extracted_data_json": json.dumps(data.__dict__)}
 
@@ -123,6 +126,7 @@ def initial_state(ticker: str) -> PipelineState:
         filing_content=None,
         filing_cik=None,
         filing_date=None,
+        xbrl_metrics=None,
         extracted_data_json=None,
         critique_json=None,
         report=None,

@@ -44,7 +44,10 @@ _METRICS_SCHEMA: dict[str, str] = {
 _SYSTEM_PROMPT = """\
 You are a senior financial analyst. Summarise the company's business model,
 recent financial performance, and key risks in 2-3 concise paragraphs based
-on the filing excerpts provided. Focus on facts already in the text."""
+on the filing excerpts provided. Focus on facts already in the text.
+
+When verified financial metrics are provided, you MUST cite those exact figures.
+Do not invent or estimate any numbers — use only the verified metrics supplied."""
 
 
 # ── HTML / text helpers ───────────────────────────────────────────────────────
@@ -174,30 +177,45 @@ async def extract(
     trace_context: TraceContext,
     *,
     gateway: LLMGateway | None = None,
+    xbrl_metrics: dict[str, float] | None = None,
 ) -> ExtractedData:
-    """Parse *document_text* and extract structured financial data via the LLM gateway."""
+    """Parse *document_text* and return structured financial data.
+
+    If *xbrl_metrics* are provided (from EDGAR XBRL), they are used directly
+    as the authoritative metrics. The LLM only produces a qualitative narrative.
+    Otherwise falls back to rule-based HTML table parsing.
+    """
     gw = gateway or get_gateway()
 
     with langfuse.start_as_current_observation(
         name="extractor",
         as_type="span",
         trace_context=trace_context,
-        input={"ticker": ticker, "doc_length": len(document_text or "")},
+        input={"ticker": ticker, "doc_length": len(document_text or ""), "xbrl": xbrl_metrics is not None},
     ) as span:
 
         sections = _split_sections(document_text)
 
-        # ── Metric extraction: rule-based from tab-separated financial table ──
-        fin_table = sections.get("financial_tables", "")
-        metrics = _extract_metrics_from_table(fin_table) if fin_table else {}
+        # ── Metrics: XBRL (preferred) or rule-based HTML fallback ────────────
+        if xbrl_metrics:
+            metrics: dict[str, object] = dict(xbrl_metrics)
+            metrics_source = "xbrl"
+        else:
+            fin_table = sections.get("financial_tables", "")
+            metrics = _extract_metrics_from_table(fin_table) if fin_table else {}
+            metrics_source = "html"
 
-        # ── Qualitative summary: LLM summarises business + MD&A + risk text ──
+        # ── Qualitative summary: LLM reads business/MD&A/risk narrative ──────
         qual_text = "\n\n".join(
             sections[k] for k in ("business", "mda", "risk_factors") if k in sections
         )[:_MAX_SECTION_CHARS]
+
+        metrics_block = _format_metrics_for_prompt(metrics, filed_date)
         user_prompt = (
-            f"Summarise the following 10-K sections for {ticker} "
-            f"(filed {filed_date}) in 2-3 paragraphs:\n\n{qual_text}"
+            f"Verified financial metrics for {ticker} (fiscal year ending {filed_date}):\n"
+            f"{metrics_block}\n\n"
+            f"Summarise the following 10-K sections in 2-3 paragraphs. "
+            f"You must use the verified metrics above when citing any figures:\n\n{qual_text}"
         )
         messages: list[Message] = [{"role": "user", "content": user_prompt}]
         response = await gw.complete(messages, system=_SYSTEM_PROMPT, max_tokens=1024)
@@ -213,11 +231,41 @@ async def extract(
         span.update(output={
             "sections": list(sections.keys()),
             "metrics_found": list(metrics.keys()),
+            "metrics_source": metrics_source,
             "input_tokens": response.input_tokens,
             "output_tokens": response.output_tokens,
         })
 
     return result
+
+
+def _format_metrics_for_prompt(metrics: dict[str, object], filed_date: str) -> str:
+    """Format verified metrics as a readable block for injection into the LLM prompt."""
+    _LABELS = {
+        "revenue": "Total Revenue",
+        "gross_profit": "Gross Profit",
+        "operating_income": "Operating Income",
+        "net_income": "Net Income",
+        "eps_basic": "Basic EPS",
+        "eps_diluted": "Diluted EPS",
+        "total_assets": "Total Assets",
+        "total_liabilities": "Total Liabilities",
+        "total_equity": "Total Stockholders' Equity",
+        "cash_and_equivalents": "Cash & Equivalents",
+        "fiscal_year_end": "Fiscal Year End",
+    }
+    lines = []
+    for key, label in _LABELS.items():
+        val = metrics.get(key)
+        if val is None:
+            continue
+        if key in ("eps_basic", "eps_diluted"):
+            lines.append(f"  {label}: ${val:.2f}")
+        elif isinstance(val, float):
+            lines.append(f"  {label}: ${val:,.0f}M")
+        else:
+            lines.append(f"  {label}: {val}")
+    return "\n".join(lines) if lines else "  (no verified metrics available)"
 
 
 def _parse_metrics(llm_text: str) -> dict[str, object]:
@@ -286,22 +334,72 @@ def _first_number(text: str) -> float | None:
     return value
 
 
+_YEAR_RE = re.compile(r"^\d{4}$")
+_SKIP_CELLS = re.compile(r"^[\$%—\-\s]*$")
+
+
+def _find_current_year_slot(lines: list[str]) -> int | None:
+    """Scan header rows and return the 0-based *numeric slot* of the most recent year.
+
+    Numeric slot counts only real number columns, ignoring '$' / '%' separators.
+
+    Example header row cells: ['', '2024', '2025', '% Change']
+    → year slots: 2024→slot 0, 2025→slot 1 → returns 1
+
+    Data row cells: ['Revenue', '$', '43,978', '$', '52,017', '18', '%']
+    → numeric slot 0 = 43,978 (FY2024), slot 1 = 52,017 (FY2025) → picks slot 1 ✓
+    """
+    for line in lines[:20]:
+        cells = [c.strip() for c in line.split("\t")]
+        year_cells = [(i, int(c)) for i, c in enumerate(cells) if _YEAR_RE.match(c)]
+        if len(year_cells) >= 2:
+            best_abs = max(year_cells, key=lambda t: t[1])[0]
+            # Convert absolute index to numeric slot (count year-like cells before it)
+            slot = sum(1 for i, _ in year_cells if i < best_abs)
+            return slot
+    return None
+
+
+def _value_at_slot(cells: list[str], slot: int) -> float | None:
+    """Return the number at numeric *slot* in cells (skipping label + separator cells)."""
+    current_slot = 0
+    for cell in cells[1:]:  # skip label
+        if _SKIP_CELLS.match(cell):
+            continue
+        val = _first_number(cell)
+        if val is not None:
+            if current_slot == slot:
+                return val if val != 0 else None
+            current_slot += 1
+    # Fallback: first non-zero number
+    for cell in cells[1:]:
+        val = _first_number(cell)
+        if val is not None and val != 0:
+            return val
+    return None
+
+
 def _extract_metrics_from_table(table_text: str) -> dict[str, object]:
     """Parse tab-separated financial table rows and return a metrics dict."""
     metrics: dict[str, object] = {}
     lines = table_text.splitlines()
 
+    current_year_slot = _find_current_year_slot(lines)
+
     for metric_key, patterns in _METRIC_PATTERNS:
         for pattern in patterns:
             for line in lines:
                 if re.search(pattern, line, re.IGNORECASE):
-                    # Take the first numeric column (most recent year)
                     cells = [c.strip() for c in line.split("\t")]
-                    for cell in cells[1:]:  # skip the label column
-                        val = _first_number(cell)
-                        if val is not None and val != 0:
-                            metrics[metric_key] = val
-                            break
+                    if current_year_slot is not None:
+                        val = _value_at_slot(cells, current_year_slot)
+                    else:
+                        val = next(
+                            (v for c in cells[1:] if (v := _first_number(c)) is not None and v != 0),
+                            None,
+                        )
+                    if val is not None:
+                        metrics[metric_key] = val
                     if metric_key in metrics:
                         break
             if metric_key in metrics:
