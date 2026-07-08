@@ -56,6 +56,30 @@ CREATE TABLE IF NOT EXISTS xbrl_facts (
     cached_at        TEXT NOT NULL,
     PRIMARY KEY (cik, accession_number)
 );
+
+-- One row per ticker per calendar day.  TTL checked in application layer (24h).
+-- INSERT OR REPLACE so a manual refresh always gets the freshest data.
+CREATE TABLE IF NOT EXISTS news_cache (
+    ticker          TEXT NOT NULL,
+    cached_date     TEXT NOT NULL,  -- YYYY-MM-DD of the fetch
+    articles_json   TEXT NOT NULL,  -- JSON array of NewsArticle dicts
+    sentiment_score REAL,           -- -1.0 to +1.0; NULL if unavailable
+    cached_at       TEXT NOT NULL,
+    PRIMARY KEY (ticker, cached_date)
+);
+
+-- One row per (ticker, data_type, period).  TTL varies by data_type:
+--   quote   / current → 15 minutes
+--   ratios  / current → 1 hour
+--   history / 1y|6m   → 24 hours
+CREATE TABLE IF NOT EXISTS market_data_cache (
+    ticker      TEXT NOT NULL,
+    data_type   TEXT NOT NULL,  -- 'quote' | 'ratios' | 'history'
+    period      TEXT NOT NULL,  -- 'current' for quote/ratios; '1y','6m' etc for history
+    data_json   TEXT NOT NULL,
+    cached_at   TEXT NOT NULL,
+    PRIMARY KEY (ticker, data_type, period)
+);
 """
 
 
@@ -192,6 +216,86 @@ class SQLiteCache:
         )
         await self._conn.commit()
 
+    # ── News cache ────────────────────────────────────────────────────────────
+
+    async def get_news(self, ticker: str, date: str) -> dict | None:
+        """Return cached news for (ticker, date) if fresher than 24h, else None."""
+        assert self._conn
+        async with self._conn.execute(
+            "SELECT articles_json, sentiment_score, cached_at FROM news_cache"
+            " WHERE ticker = ? AND cached_date = ?",
+            (ticker.upper(), date),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        if _is_stale(row["cached_at"], hours=24):
+            return None
+        return {
+            "articles": json.loads(row["articles_json"]),
+            "sentiment_score": row["sentiment_score"],
+        }
+
+    async def store_news(
+        self,
+        ticker: str,
+        date: str,
+        articles: list[dict],
+        sentiment_score: float | None,
+    ) -> None:
+        assert self._conn
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO news_cache
+               (ticker, cached_date, articles_json, sentiment_score, cached_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (ticker.upper(), date, json.dumps(articles), sentiment_score, _now()),
+        )
+        await self._conn.commit()
+
+    # ── Market data cache ─────────────────────────────────────────────────────
+
+    _MARKET_TTL_HOURS: dict[str, float] = {
+        "quote":   0.25,   # 15 minutes
+        "ratios":  1.0,    # 1 hour
+        "history": 24.0,   # 24 hours
+    }
+
+    async def get_market_data(
+        self, ticker: str, data_type: str, period: str
+    ) -> dict | None:
+        """Return cached market data if within TTL for data_type, else None."""
+        assert self._conn
+        async with self._conn.execute(
+            "SELECT data_json, cached_at FROM market_data_cache"
+            " WHERE ticker = ? AND data_type = ? AND period = ?",
+            (ticker.upper(), data_type, period),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        ttl_hours = self._MARKET_TTL_HOURS.get(data_type, 1.0)
+        if _is_stale(row["cached_at"], hours=ttl_hours):
+            return None
+        return json.loads(row["data_json"])
+
+    async def store_market_data(
+        self, ticker: str, data_type: str, period: str, data: dict
+    ) -> None:
+        assert self._conn
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO market_data_cache
+               (ticker, data_type, period, data_json, cached_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (ticker.upper(), data_type, period, json.dumps(data), _now()),
+        )
+        await self._conn.commit()
+
 
 def _now() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _is_stale(cached_at: str, *, hours: float) -> bool:
+    """Return True if cached_at is older than *hours* from now."""
+    age = datetime.now(tz=timezone.utc) - datetime.fromisoformat(cached_at)
+    return age.total_seconds() > hours * 3600

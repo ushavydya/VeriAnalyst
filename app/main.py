@@ -38,6 +38,29 @@ def _fmt_millions(value: float) -> str:
         return f"${value / 1_000:.2f}B"
     return f"${value:,.0f}M"
 
+
+def _extract_intelligence_section(report: str) -> str | None:
+    """Extract the Investment Intelligence section from the report regardless of heading style.
+
+    The LLM may render it as '## Investment Intelligence', '**Investment Intelligence**',
+    '5. **Investment Intelligence**', etc.  We search case-insensitively for the keyword
+    and grab everything up to the next same-level heading.
+    """
+    import re
+    # Match any heading line that contains "investment intelligence" (case-insensitive)
+    pattern = re.compile(r"((?:^|\n)(#{1,3}[^\n]*investment intelligence[^\n]*|[^\n]*\*\*investment intelligence\*\*[^\n]*))", re.IGNORECASE)
+    m = pattern.search(report)
+    if not m:
+        return None
+    start = m.start(1)
+    # Find the next Markdown heading at the same or higher level after this section
+    next_heading = re.search(r"\n#{1,3} ", report[start + 1:])
+    # Also look for numbered bold headings like "\n5. **" or "\n**"
+    next_bold = re.search(r"\n\d+\.\s+\*\*|\n\*\*[A-Z]", report[start + 1:])
+    candidates = [c.start() + start + 1 for c in [next_heading, next_bold] if c]
+    end = min(candidates) if candidates else len(report)
+    return report[start:end].strip()
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 if "messages" not in st.session_state:
@@ -50,6 +73,10 @@ if "confidence" not in st.session_state:
     st.session_state.confidence = None
 if "ticker" not in st.session_state:
     st.session_state.ticker = None
+if "news_summary_json" not in st.session_state:
+    st.session_state.news_summary_json = None
+if "market_summary_json" not in st.session_state:
+    st.session_state.market_summary_json = None
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
@@ -86,6 +113,8 @@ with st.sidebar:
         st.session_state.metrics = {}
         st.session_state.confidence = None
         st.session_state.ticker = None
+        st.session_state.news_summary_json = None
+        st.session_state.market_summary_json = None
         st.rerun()
 
 # ── Pipeline runner ───────────────────────────────────────────────────────────
@@ -201,7 +230,7 @@ def _answer_question(question: str, report: str) -> str:
 
 import json
 
-tab_analysis, tab_trends, tab_compare = st.tabs(["📄 Analysis", "📈 Trends", "⚖️ Compare"])
+tab_analysis, tab_trends, tab_compare, tab_intel = st.tabs(["📄 Analysis", "📈 Trends", "⚖️ Compare", "🧠 Intelligence"])
 
 # ── Tab 1: Analysis + chat ────────────────────────────────────────────────────
 
@@ -219,7 +248,11 @@ with tab_analysis:
                 try:
                     result = _run_pipeline(ticker_input)
                 except Exception as e:
-                    st.error(f"Pipeline exception: {e}")
+                    import traceback
+                    msg = str(e) or type(e).__name__
+                    st.error(f"Pipeline exception: {msg}")
+                    with st.expander("Full traceback"):
+                        st.code(traceback.format_exc())
                     st.stop()
 
             if result.get("error"):
@@ -239,6 +272,8 @@ with tab_analysis:
         if result.get("extracted_data_json"):
             data = json.loads(result["extracted_data_json"])
             st.session_state.metrics = data.get("metrics", {})
+        st.session_state.news_summary_json = result.get("news_summary_json")
+        st.session_state.market_summary_json = result.get("market_summary_json")
 
         st.rerun()
 
@@ -421,3 +456,133 @@ with tab_compare:
             st.divider()
             st.subheader("Comparative analysis")
             st.markdown(result.report)
+
+# ── Tab 4: Investment Intelligence ───────────────────────────────────────────
+
+with tab_intel:
+    st.subheader("🧠 Investment Intelligence")
+
+    news_json = st.session_state.news_summary_json
+    market_json = st.session_state.market_summary_json
+    intel_ticker = st.session_state.ticker
+
+    if not intel_ticker:
+        st.info("Run an analysis from the sidebar to see live market data and news here.")
+    else:
+        st.caption(f"Live data for **{intel_ticker}** fetched alongside the most recent analysis run.")
+
+        # ── Market data ───────────────────────────────────────────────────
+        st.markdown("### 📉 Market Data")
+        if not market_json:
+            st.warning("Market data unavailable — check that FINNHUB_API_KEY is set.")
+        else:
+            mkt = json.loads(market_json)
+            quote = mkt.get("quote")
+            ratios = mkt.get("ratios")
+
+            if quote:
+                price = quote.get("price") or 0
+                change_pct = quote.get("change_pct") or 0
+                volume = quote.get("volume") or 0
+
+                col_p, col_c, col_v = st.columns(3)
+                col_p.metric("Current Price", f"${price:,.2f}" if price else "—")
+                col_c.metric("Intraday Change", f"{change_pct:+.2f}%" if change_pct else "—",
+                             delta=f"{change_pct:+.2f}%" if change_pct else None)
+                col_v.metric("Volume", f"{volume:,}" if volume else "—")
+
+            if ratios:
+                st.divider()
+                col_pe, col_pb, col_b, col_hi, col_lo = st.columns(5)
+                pe = ratios.get("pe_ratio")
+                pb = ratios.get("pb_ratio")
+                beta = ratios.get("beta")
+                hi = ratios.get("week_52_high")
+                lo = ratios.get("week_52_low")
+                if pe:
+                    pe_label = f"{pe:.1f}x"
+                    pe_help = "Computed from current price ÷ EPS (diluted) from the most recent 10-K filing" if mkt.get("pe_computed") else None
+                else:
+                    xbrl_eps = st.session_state.metrics.get("eps_diluted")
+                    if xbrl_eps is not None and xbrl_eps < 0:
+                        pe_label = "N/M (loss)"
+                        pe_help = "P/E not meaningful — company reported a net loss in the most recent filing"
+                    else:
+                        pe_label = "—"
+                        pe_help = None
+                col_pe.metric("P/E Ratio", pe_label, help=pe_help)
+                col_pb.metric("P/B Ratio", f"{pb:.1f}x" if pb else "—")
+                col_b.metric("Beta", f"{beta:.2f}" if beta else "—")
+                col_hi.metric("52W High", f"${hi:,.2f}" if hi else "—")
+                col_lo.metric("52W Low", f"${lo:,.2f}" if lo else "—")
+
+                if quote and hi and quote.get("price"):
+                    pct_vs_high = round((quote["price"] / hi - 1) * 100, 1)
+                    st.caption(f"Current price is **{pct_vs_high:+.1f}%** vs 52-week high.")
+
+
+            cache_hits = mkt.get("cache_hits", {})
+            if cache_hits:
+                cached = [k for k, v in cache_hits.items() if v]
+                live = [k for k, v in cache_hits.items() if not v]
+                parts = []
+                if cached:
+                    parts.append(f"cached: {', '.join(cached)}")
+                if live:
+                    parts.append(f"live: {', '.join(live)}")
+                st.caption(f"Data sources — {'; '.join(parts)}")
+
+        # ── News & sentiment ──────────────────────────────────────────────
+        st.markdown("### 📰 Recent News & Sentiment")
+        if not news_json:
+            st.warning("News data unavailable — check that FINNHUB_API_KEY is set.")
+        else:
+            news = json.loads(news_json)
+            sentiment_score = news.get("sentiment_score")
+            articles = news.get("articles", [])
+            date = news.get("date", "")
+
+            # Sentiment gauge
+            if sentiment_score is not None:
+                label = "Bullish 📈" if sentiment_score >= 0.2 else ("Bearish 📉" if sentiment_score <= -0.2 else "Neutral ➡️")
+                col_sl, col_sv = st.columns([3, 1])
+                col_sl.progress(
+                    int((sentiment_score + 1) / 2 * 100),
+                    text=f"Sentiment: **{label}**",
+                )
+                col_sv.metric("Score", f"{sentiment_score:+.2f}", help="-1.0 = fully bearish, +1.0 = fully bullish")
+            else:
+                st.caption("Sentiment score not available from Finnhub for this ticker (free-tier limitation — buzz data requires sufficient article volume).")
+
+            st.caption(f"Showing {len(articles)} article(s) fetched on {date}" + (" _(from cache)_" if news.get("cache_hit") else ""))
+
+            if articles:
+                for art in articles[:10]:
+                    with st.expander(art.get("headline", "No headline"), expanded=False):
+                        summary = art.get("summary", "")
+                        if summary:
+                            st.write(summary)
+                        url = art.get("url", "")
+                        source = art.get("source", "")
+                        pub = art.get("published_at", "")
+                        meta = " · ".join(filter(None, [source, pub[:10] if pub else ""]))
+                        if meta:
+                            st.caption(meta)
+                        if url:
+                            st.markdown(f"[Read full article →]({url})")
+            else:
+                st.info(f"No recent news articles found for {intel_ticker}.")
+
+        # ── Intelligence synthesis ────────────────────────────────────────
+        st.divider()
+        st.markdown("### 🔍 Synthesis")
+        st.caption("The Investment Intelligence section of the analysis report is reproduced below.")
+        report = st.session_state.report
+        if report:
+            snippet = _extract_intelligence_section(report)
+            if snippet:
+                st.markdown(snippet)
+            else:
+                st.info("No Investment Intelligence section found in this report. Re-run the analysis with FINNHUB_API_KEY set to generate one.")
+        else:
+            st.info("Run an analysis to see the investment intelligence synthesis.")

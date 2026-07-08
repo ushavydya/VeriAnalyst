@@ -25,6 +25,8 @@ dependencies = [
   # Web UI
   "streamlit>=1.35.0",
   "nest-asyncio>=1.6.0",
+  # Market data
+  "yfinance>=0.2.40",
 ]
 
 [project.optional-dependencies]
