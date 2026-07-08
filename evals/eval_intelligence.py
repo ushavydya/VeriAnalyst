@@ -11,14 +11,15 @@ Checks per ticker:
     - price > 0
     - P/E ratio in plausible range (0–500) if present
     - 52W high >= 52W low
-    - history has at least 100 daily bars
+    - history has at least 100 daily bars (WARN on free tier)
   News:
-    - at least 1 article returned (or Finnhub free-tier limitation noted)
-    - sentiment score in [-1.0, 1.0] if present
+    - at least 1 article returned
+    - LLM-computed sentiment score in [-1.0, 1.0] when articles present
+    - LLM-generated narrative present when articles present
     - cache hit on second call (TTL not yet expired)
+    - narrative preserved from cache on second call
   Critic:
     - market and news data flow through to critic_node without crashing
-    - divergence signals appear when sentiment is strongly one-sided vs. fundamentals
   Report:
     - "Investment Intelligence" section present in report when data is available
 """
@@ -93,12 +94,20 @@ def _check_news(news_json: str | None, ticker: str) -> list[str]:
     d = json.loads(news_json)
     articles = d.get("articles", [])
     if not articles:
-        # Finnhub free tier sometimes returns empty — treat as a warning, not failure
         issues.append(f"No articles returned for {ticker} (may be a Finnhub free-tier limit)")
+        return issues
 
+    # Sentiment score — LLM-computed so should always be present when articles exist
     score = d.get("sentiment_score")
-    if score is not None and not (-1.0 <= score <= 1.0):
+    if score is None:
+        issues.append(f"sentiment_score is None despite {len(articles)} articles — LLM sentiment failed")
+    elif not (-1.0 <= score <= 1.0):
         issues.append(f"sentiment_score={score} is outside [-1, 1]")
+
+    # Narrative — LLM-generated summary, always expected when articles are present
+    narrative = d.get("narrative")
+    if not narrative:
+        issues.append("LLM-generated narrative is missing despite articles being present")
 
     return issues
 
@@ -179,6 +188,9 @@ async def _eval_ticker(ticker: str, langfuse: Langfuse, trace_id: str) -> dict:
         news2 = json.loads(result2["news_summary_json"])
         if not news2.get("cache_hit"):
             issues.append("News was not served from cache on second run")
+        # Narrative must survive the cache round-trip
+        if news2.get("articles") and not news2.get("narrative"):
+            issues.append("News narrative was not preserved in cache on second run")
 
     hard_issues = [i for i in issues if not i.startswith("WARN:")]
     passed = len(hard_issues) == 0
@@ -191,6 +203,7 @@ async def _eval_ticker(ticker: str, langfuse: Langfuse, trace_id: str) -> dict:
         comment="; ".join(issues) if issues else "all checks passed",
     )
 
+    news_d = json.loads(news_json) if news_json else {}
     return {
         "ticker": ticker,
         "passed": passed,
@@ -199,8 +212,9 @@ async def _eval_ticker(ticker: str, langfuse: Langfuse, trace_id: str) -> dict:
         "has_market": market_json is not None,
         "has_news": news_json is not None,
         "market_bar_count": json.loads(market_json).get("history_bar_count", 0) if market_json else 0,
-        "article_count": len(json.loads(news_json).get("articles", [])) if news_json else 0,
-        "sentiment_score": json.loads(news_json).get("sentiment_score") if news_json else None,
+        "article_count": len(news_d.get("articles", [])),
+        "sentiment_score": news_d.get("sentiment_score"),
+        "has_narrative": bool(news_d.get("narrative")),
         "has_intelligence_section": "Investment Intelligence" in (report or ""),
         "critic_issues_count": len(json.loads(critique_json).get("issues", [])) if critique_json else 0,
     }
@@ -216,12 +230,12 @@ def _print_results(results: list[dict]) -> None:
         mark = "✓" if r["passed"] else "✗"
         detail = "OK" if r["passed"] else "; ".join(r["issues"][:2])
         print(f"{r['ticker']:<8} {mark:^5} {r['score']:^6.2f}  {detail}")
+        sentiment_str = f"{r['sentiment_score']:+.2f}" if r['sentiment_score'] is not None else "n/a"
         print(
-            f"         market={'yes' if r['has_market'] else 'no'} "
-            f"({r['market_bar_count']} bars)  "
+            f"         market={'yes' if r['has_market'] else 'no'} ({r['market_bar_count']} bars)  "
             f"news={'yes' if r['has_news'] else 'no'} "
-            f"({r['article_count']} articles, "
-            f"sentiment={r['sentiment_score'] if r['sentiment_score'] is not None else 'n/a'})  "
+            f"({r['article_count']} articles, sentiment={sentiment_str}, "
+            f"narrative={'yes' if r['has_narrative'] else 'no'})  "
             f"intel_section={'yes' if r['has_intelligence_section'] else 'no'}  "
             f"critic_issues={r['critic_issues_count']}"
         )
@@ -258,7 +272,8 @@ async def run_intelligence_evals(tickers: list[str]) -> list[dict]:
             results.append({"ticker": ticker, "passed": False, "score": 0.0,
                             "issues": [str(e)], "has_market": False, "has_news": False,
                             "market_bar_count": 0, "article_count": 0, "sentiment_score": None,
-                            "has_intelligence_section": False, "critic_issues_count": 0})
+                            "has_narrative": False, "has_intelligence_section": False,
+                            "critic_issues_count": 0})
 
     langfuse.flush()
     _print_results(results)

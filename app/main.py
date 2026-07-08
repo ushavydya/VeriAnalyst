@@ -552,7 +552,12 @@ with tab_intel:
                 )
                 col_sv.metric("Score", f"{sentiment_score:+.2f}", help="-1.0 = fully bearish, +1.0 = fully bullish")
             else:
-                st.caption("Sentiment score not available from Finnhub for this ticker (free-tier limitation — buzz data requires sufficient article volume).")
+                st.caption("Sentiment score not available.")
+
+            # LLM-generated narrative
+            narrative = news.get("narrative")
+            if narrative:
+                st.info(narrative)
 
             st.caption(f"Showing {len(articles)} article(s) fetched on {date}" + (" _(from cache)_" if news.get("cache_hit") else ""))
 

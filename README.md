@@ -25,7 +25,7 @@ Every agent span is traced in Langfuse. Confidence scores are auto-posted as Lan
 - **Langfuse observability** — per-agent latency, token usage, confidence scores, and trace waterfall at `http://localhost:3000`
 - **TTL-aware cache** — SQLite for EDGAR metadata + XBRL facts + market data + news (market data: 15 min–24 h TTLs); filesystem for documents
 - **Eval suite** — extractor accuracy, trends consistency, intelligence layer, critic logic, and LLM-as-judge report quality evals; all post scores to Langfuse
-- **158 unit tests** — cache, providers, news agent, market agent, critic checks, and full pipeline (mocked LLM + HTTP)
+- **197 unit tests** — cache, providers, news agent, market agent, critic checks, graph orchestration, and writer (mocked LLM + HTTP)
 - **Ollama support** — runs fully offline with a local model; swap to Anthropic by setting `LLM_PROVIDER=anthropic`
 
 ## Quickstart
@@ -191,8 +191,9 @@ The intelligence node runs in parallel with EDGAR retrieval and provides two dat
 
 **News** (via `news_agent.py`):
 - Up to 20 recent headlines with source and URL
-- Aggregate sentiment score from Finnhub (–1.0 bearish → +1.0 bullish)
-- 24-hour TTL cache
+- Two-stage sentiment: provider score from Finnhub (when available) with LLM-computed score as fallback
+- LLM-generated 2-sentence narrative summarising the news themes — always computed from article content, never from training data
+- 24-hour TTL cache; narrative and sentiment are stored alongside articles and back-filled automatically on stale cache entries
 
 The critic then checks for divergences: bearish news on a profitable company, bullish news on a loss-maker, stock near 52W low despite positive net income. These appear as informational signals in the report but do not penalise the confidence score.
 

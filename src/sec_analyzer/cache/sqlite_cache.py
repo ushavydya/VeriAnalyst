@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS news_cache (
     cached_date     TEXT NOT NULL,  -- YYYY-MM-DD of the fetch
     articles_json   TEXT NOT NULL,  -- JSON array of NewsArticle dicts
     sentiment_score REAL,           -- -1.0 to +1.0; NULL if unavailable
+    narrative       TEXT,           -- LLM-generated 2-sentence summary; NULL if unavailable
     cached_at       TEXT NOT NULL,
     PRIMARY KEY (ticker, cached_date)
 );
@@ -81,6 +82,15 @@ CREATE TABLE IF NOT EXISTS market_data_cache (
     PRIMARY KEY (ticker, data_type, period)
 );
 """
+
+
+async def _migrate(conn: aiosqlite.Connection) -> None:
+    """Apply additive schema migrations that ALTER TABLE cannot be expressed in _SCHEMA."""
+    # Add narrative column to news_cache (introduced alongside LLM sentiment computation)
+    async with conn.execute("PRAGMA table_info(news_cache)") as cur:
+        columns = {row["name"] async for row in cur}
+    if "narrative" not in columns:
+        await conn.execute("ALTER TABLE news_cache ADD COLUMN narrative TEXT")
 
 
 class SQLiteCache:
@@ -102,6 +112,7 @@ class SQLiteCache:
         self._conn = await aiosqlite.connect(self._db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        await _migrate(self._conn)
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -222,7 +233,7 @@ class SQLiteCache:
         """Return cached news for (ticker, date) if fresher than 24h, else None."""
         assert self._conn
         async with self._conn.execute(
-            "SELECT articles_json, sentiment_score, cached_at FROM news_cache"
+            "SELECT articles_json, sentiment_score, narrative, cached_at FROM news_cache"
             " WHERE ticker = ? AND cached_date = ?",
             (ticker.upper(), date),
         ) as cur:
@@ -234,6 +245,7 @@ class SQLiteCache:
         return {
             "articles": json.loads(row["articles_json"]),
             "sentiment_score": row["sentiment_score"],
+            "narrative": row["narrative"],
         }
 
     async def store_news(
@@ -242,13 +254,14 @@ class SQLiteCache:
         date: str,
         articles: list[dict],
         sentiment_score: float | None,
+        narrative: str | None = None,
     ) -> None:
         assert self._conn
         await self._conn.execute(
             """INSERT OR REPLACE INTO news_cache
-               (ticker, cached_date, articles_json, sentiment_score, cached_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (ticker.upper(), date, json.dumps(articles), sentiment_score, _now()),
+               (ticker, cached_date, articles_json, sentiment_score, narrative, cached_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (ticker.upper(), date, json.dumps(articles), sentiment_score, narrative, _now()),
         )
         await self._conn.commit()
 

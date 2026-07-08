@@ -97,11 +97,19 @@ async def test_cik_returns_none_when_missing(cache: SQLiteCache):
 
 async def test_news_round_trip(cache: SQLiteCache):
     articles = [{"headline": "Big news", "summary": "Details", "url": "http://x", "source": "Reuters", "published_at": "2026-07-07T00:00:00+00:00"}]
-    await cache.store_news("AAPL", "2026-07-07", articles, 0.35)
+    await cache.store_news("AAPL", "2026-07-07", articles, 0.35, "Positive outlook driven by strong earnings.")
     result = await cache.get_news("AAPL", "2026-07-07")
     assert result is not None
     assert result["articles"] == articles
     assert result["sentiment_score"] == pytest.approx(0.35)
+    assert result["narrative"] == "Positive outlook driven by strong earnings."
+
+
+async def test_news_round_trip_without_narrative(cache: SQLiteCache):
+    await cache.store_news("AAPL", "2026-07-07", [], 0.1)
+    result = await cache.get_news("AAPL", "2026-07-07")
+    assert result is not None
+    assert result["narrative"] is None
 
 
 async def test_news_returns_none_when_missing(cache: SQLiteCache):

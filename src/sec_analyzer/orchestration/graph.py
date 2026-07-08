@@ -110,6 +110,7 @@ def build_pipeline(
                 "date": news_result.date,
                 "articles": [dataclasses.asdict(a) for a in news_result.articles],
                 "sentiment_score": news_result.sentiment_score,
+                "narrative": news_result.narrative,
                 "cache_hit": news_result.cache_hit,
             })
 
@@ -230,6 +231,7 @@ def _deserialise_news(json_str: str | None) -> NewsSummary | None:
         date=d["date"],
         articles=[NewsArticle(**a) for a in d.get("articles", [])],
         sentiment_score=d.get("sentiment_score"),
+        narrative=d.get("narrative"),
         cache_hit=d.get("cache_hit", False),
     )
 

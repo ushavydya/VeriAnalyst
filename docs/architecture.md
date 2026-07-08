@@ -67,9 +67,12 @@ Runs after the retriever in parallel with EDGAR document processing. Uses `async
 **News Agent (`news_agent.py`)**
 
 - Calls `NewsProvider.fetch_news(ticker)` for up to 20 recent headlines.
-- Sentiment score (`-1.0` bearish → `+1.0` bullish) comes from Finnhub's buzz/sentiment endpoint.
-- 24-hour TTL cache in `news_cache` SQLite table.
-- Returns `NewsSummary(ticker, date, articles, sentiment_score, cache_hit)`.
+- **Two-stage sentiment:**
+  1. Provider score — Finnhub's pre-computed buzz/sentiment (`-1.0` bearish → `+1.0` bullish). Used when available.
+  2. LLM score + narrative — always computed from article headlines/summaries. Produces a score in `[-1.0, 1.0]` plus a 2-sentence narrative of the news themes. Fills in when the provider score is `None` (common on Finnhub free tier).
+- **Back-fill on cache hit:** if a cached entry has articles but no narrative (pre-dates the LLM sentiment feature), the LLM pass runs and the cache is updated in-place.
+- 24-hour TTL cache in `news_cache` SQLite table; `narrative` column added via `_migrate()`.
+- Returns `NewsSummary(ticker, date, articles, sentiment_score, narrative, cache_hit)`.
 
 **Market Agent (`market_agent.py`)**
 
@@ -194,7 +197,7 @@ Six stores, with TTL enforcement for real-time data:
 | SQLite `filings` | (ticker, form_type, accession_number) | none | filing metadata |
 | SQLite `xbrl_facts` | (cik, "raw") | none | raw EDGAR company facts JSON |
 | SQLite `documents` + filesystem | SHA-256(URL)[:16] | none | raw HTM text as `.txt` |
-| SQLite `news_cache` | (ticker, date) | 24 h | articles list + sentiment score |
+| SQLite `news_cache` | (ticker, date) | 24 h | articles list + sentiment score + LLM narrative |
 | SQLite `market_data_cache` | (ticker, data_type, period) | 15 min / 1 h / 24 h | quote / ratios / price history |
 
 `filings` PK includes `accession_number` so all historical filings coexist; `get_filing()` returns the most recent by `filed_date DESC`.
@@ -217,7 +220,7 @@ Fetches 3 years of 10-K filings for UBER, AAPL, MSFT. Checks: fiscal year values
 
 ### `eval_intelligence.py` — Intelligence layer integration
 
-End-to-end check with a live Finnhub key: market data present and plausible, news articles returned, cache hit on second call, "Investment Intelligence" section present in the report, critic well-formed. 0 history bars treated as a warning (Finnhub free-tier limitation), not a hard failure.
+End-to-end check with a live Finnhub key: market data present and plausible, news articles returned, LLM-computed sentiment score and narrative present when articles exist, narrative preserved through cache round-trip, "Investment Intelligence" section present in the report, critic well-formed. 0 history bars treated as a warning (Finnhub free-tier limitation), not a hard failure.
 
 ### `eval_critic.py` — Rule/market/divergence logic (no LLM, fast)
 
@@ -229,16 +232,18 @@ Sends the generated report + extracted metrics to the LLM acting as a judge. Sco
 
 ### Unit tests (`tests/`)
 
-158 pytest-asyncio tests covering:
+197 pytest-asyncio tests covering:
 - `test_xbrl.py` — XBRL entry selection, concept fallbacks, scaling, fiscal year filtering
-- `test_sqlite_cache.py` — cache round-trips, filing ordering, CIK lookup, news/market TTL
+- `test_sqlite_cache.py` — cache round-trips, filing ordering, CIK lookup, news/market TTL, narrative persistence
 - `test_extractor.py` — HTML parsing, XBRL path, prompt injection, fallback
 - `test_retriever.py` — cache hit/miss paths, rate limiter, URL construction
 - `test_providers.py` — ABC enforcement, factory functions, mocked Finnhub HTTP
-- `test_news_agent.py` — cache-first path, provider error handling, sentiment label
-- `test_market_agent.py` — parallel fetch, computed P/E (pe_computed flag), partial failure
+- `test_news_agent.py` — two-stage sentiment (provider → LLM fallback), narrative generation, cache back-fill, error resilience
+- `test_market_agent.py` — parallel fetch, computed P/E (`pe_computed` flag), partial failure
 - `test_critic.py` — rule checks, market checks, divergence signals, integration
-- `test_writer.py`, `test_gateway.py`
+- `test_graph.py` — pipeline state transitions, JSON deserialisation, error propagation, intelligence disabled path
+- `test_writer.py` — `_format_news` with/without narrative, fiscal year label (`FY2025` not `FY26`), writer prompt content
+- `test_gateway.py`
 
 All tests run in under 2 seconds with no network calls.
 

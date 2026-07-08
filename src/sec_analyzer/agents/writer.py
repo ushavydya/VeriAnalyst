@@ -59,6 +59,9 @@ def _format_news(news: NewsSummary | None) -> str:
         return "_No recent news available._"
     lines = [f"Sentiment: **{news.sentiment_label}**"
              + (f" ({news.sentiment_score:+.2f})" if news.sentiment_score is not None else "")]
+    if news.narrative:
+        lines.append(f"\n{news.narrative}")
+    lines.append("")
     for a in news.articles[:5]:
         lines.append(f"- [{a.headline}]({a.url}) — {a.source}")
     return "\n".join(lines)
