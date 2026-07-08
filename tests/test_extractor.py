@@ -8,10 +8,12 @@ import pytest
 
 from sec_analyzer.agents.extractor import (
     ExtractedData,
+    _find_current_year_slot,
     _format_metrics_for_prompt,
     _html_to_text,
     _parse_metrics,
     _split_sections,
+    _value_at_slot,
     extract,
 )
 from sec_analyzer.gateway.base import ModelResponse
@@ -278,3 +280,42 @@ async def test_extract_falls_back_to_html_when_no_xbrl():
     )
 
     assert result.metrics.get("revenue") == 394328.0
+
+
+# ── _value_at_slot zero-value fix ─────────────────────────────────────────────
+
+def test_value_at_slot_returns_zero_for_breakeven():
+    """Zero is a valid financial metric and must not be discarded."""
+    cells = ["Net Income", "0"]
+    assert _value_at_slot(cells, slot=0) == 0.0
+
+
+def test_value_at_slot_negative_zero_not_discarded():
+    """Negative zero from parenthetical notation must not be discarded either."""
+    cells = ["Operating Income", "(0)"]
+    result = _value_at_slot(cells, slot=0)
+    assert result is not None
+
+
+# ── _find_current_year_slot slot-index fix ────────────────────────────────────
+
+def test_find_current_year_slot_ignores_non_year_numeric_columns():
+    """A Growth% column between year columns must not shift the slot index."""
+    header = "Label\t2024\tGrowth%\t2025"
+    slot = _find_current_year_slot([header])
+    assert slot == 1  # 2025 is numeric slot 1, not slot 2
+
+
+def test_find_current_year_slot_simple_two_year_header():
+    """Standard two-column header returns slot 1 for the most recent year."""
+    header = "Label\t2024\t2025"
+    slot = _find_current_year_slot([header])
+    assert slot == 1
+
+
+def test_value_at_slot_consistent_with_slot_index():
+    """Slot returned by _find_current_year_slot picks the correct data column."""
+    header = "Label\t2024\tGrowth%\t2025"
+    slot = _find_current_year_slot([header])
+    data = ["Revenue", "43,978", "18%", "52,017"]
+    assert _value_at_slot(data, slot) == 52017.0

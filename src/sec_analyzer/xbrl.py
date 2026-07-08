@@ -49,11 +49,17 @@ def fetch_xbrl_facts(
     fiscal_year_end: str | None = None,
     *,
     raw: dict[str, Any] | None = None,
+    accession_number: str | None = None,
 ) -> dict[str, float]:
     """Extract metrics from XBRL data.
 
-    *fiscal_year_end* — YYYY or YYYY-MM-DD of the fiscal year end. If None,
-    returns the most recently filed 10-K annual values regardless of year.
+    *accession_number* — when provided, matches entries by their accn field so
+    historical filings each return the data from that specific filing rather than
+    always returning the most recent year. Falls back to fy_year / most-recent
+    if the accession isn't found in the facts.
+
+    *fiscal_year_end* — YYYY or YYYY-MM-DD of the fiscal year end. Used as a
+    fallback filter when accession matching finds nothing.
 
     Pass *raw* to avoid a second HTTP call if you already have the JSON.
     Otherwise call :func:`download_xbrl_facts` first.
@@ -65,20 +71,28 @@ def fetch_xbrl_facts(
     fy_year = fiscal_year_end[:4] if fiscal_year_end else None
 
     metrics: dict[str, float] = {}
-    fiscal_year_end: str | None = None
+    fy_end_out: str | None = None
 
     for metric_key, concepts, unit_key, scale in _CONCEPT_MAP:
+        best_entry: dict | None = None
         for concept in concepts:
-            entry = _pick_entry(us_gaap.get(concept, {}), fy_year, unit_key)
-            if entry is not None:
-                val = float(entry["val"])
-                metrics[metric_key] = val / 1_000_000 if scale else val
-                if fiscal_year_end is None:
-                    fiscal_year_end = entry.get("end")
-                break
+            entry = _pick_entry(
+                us_gaap.get(concept, {}), fy_year, unit_key,
+                accession_number=accession_number,
+            )
+            if entry is None:
+                continue
+            if best_entry is None or entry.get("end", "") > best_entry.get("end", ""):
+                best_entry = entry
 
-    if fiscal_year_end:
-        metrics["fiscal_year_end"] = fiscal_year_end  # type: ignore[assignment]
+        if best_entry is not None:
+            val = float(best_entry["val"])
+            metrics[metric_key] = val / 1_000_000 if scale else val
+            if fy_end_out is None:
+                fy_end_out = best_entry.get("end")
+
+    if fy_end_out:
+        metrics["fiscal_year_end"] = fy_end_out  # type: ignore[assignment]
 
     return metrics
 
@@ -99,11 +113,21 @@ async def download_xbrl_facts(cik: str, headers: dict[str, str]) -> dict[str, An
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _pick_entry(concept_data: dict, fy_year: str | None, unit_key: str) -> dict | None:
+def _pick_entry(
+    concept_data: dict,
+    fy_year: str | None,
+    unit_key: str,
+    *,
+    accession_number: str | None = None,
+) -> dict | None:
     """Return the best matching XBRL entry dict for a single concept.
 
-    If *fy_year* is given, filters to that fiscal year end (YYYY).
-    If None, returns the entry from the most recent fiscal year.
+    Priority order:
+    1. If *accession_number* is given, match by accn field — exact filing match.
+       Falls back to fy_year / most-recent if the accession isn't found (e.g. the
+       concept was restated under a different accession in an amendment).
+    2. If *fy_year* is given (YYYY), filter to that fiscal year end.
+    3. Otherwise return the most recent fiscal year entry.
     """
     units = concept_data.get("units", {})
     entries: list[dict] = units.get(unit_key, [])
@@ -112,12 +136,23 @@ def _pick_entry(concept_data: dict, fy_year: str | None, unit_key: str) -> dict 
         e for e in entries
         if e.get("form") == "10-K" and e.get("val") is not None
     ]
+
+    if accession_number:
+        # Normalise accession: EDGAR stores with dashes (e.g. "0001543151-26-000015")
+        normed = accession_number if "-" in accession_number else (
+            f"{accession_number[:10]}-{accession_number[10:12]}-{accession_number[12:]}"
+        )
+        by_accession = [e for e in candidates if e.get("accn") == normed]
+        if by_accession:
+            by_accession.sort(key=lambda e: (e.get("end", ""), e.get("filed", "")), reverse=True)
+            return by_accession[0]
+        # Fall through to fy_year / most-recent if accession not found
+
     if fy_year:
         candidates = [e for e in candidates if e.get("end", "").startswith(fy_year)]
 
     if not candidates:
         return None
 
-    # Sort by fiscal year end descending, then filed date (for amendments)
     candidates.sort(key=lambda e: (e.get("end", ""), e.get("filed", "")), reverse=True)
     return candidates[0]

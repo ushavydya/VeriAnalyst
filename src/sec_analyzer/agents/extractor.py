@@ -335,27 +335,34 @@ def _first_number(text: str) -> float | None:
 
 
 _YEAR_RE = re.compile(r"^\d{4}$")
-_SKIP_CELLS = re.compile(r"^[\$%—\-\s]*$")
+# Matches separator/label cells that don't carry financial values.
+# Second alternative catches numeric percentage cells like "18%" or "(5%)" —
+# growth-rate columns that appear between year columns in some 10-K tables.
+_SKIP_CELLS = re.compile(r"^[\$%—\-\s]*$|^-?\(?\d[\d,.]*\)?\s*%$")
 
 
 def _find_current_year_slot(lines: list[str]) -> int | None:
     """Scan header rows and return the 0-based *numeric slot* of the most recent year.
 
-    Numeric slot counts only real number columns, ignoring '$' / '%' separators.
+    Numeric slot counts non-skip cells before the best-year column, mirroring
+    exactly how _value_at_slot iterates data rows.
 
-    Example header row cells: ['', '2024', '2025', '% Change']
-    → year slots: 2024→slot 0, 2025→slot 1 → returns 1
-
-    Data row cells: ['Revenue', '$', '43,978', '$', '52,017', '18', '%']
-    → numeric slot 0 = 43,978 (FY2024), slot 1 = 52,017 (FY2025) → picks slot 1 ✓
+    Example header row cells: ['', '2024', 'Growth%', '2025']
+    → best_abs=3; non-skip cells before index 3: '2024', 'Growth%' → slot 2? No —
+    we mirror _value_at_slot which skips cells matching _SKIP_CELLS.
+    '2024' is a number → slot 0; 'Growth%' matches _SKIP_CELLS → skipped; '2025' → slot 1.
+    Returns 1 ✓
     """
     for line in lines[:20]:
         cells = [c.strip() for c in line.split("\t")]
         year_cells = [(i, int(c)) for i, c in enumerate(cells) if _YEAR_RE.match(c)]
         if len(year_cells) >= 2:
             best_abs = max(year_cells, key=lambda t: t[1])[0]
-            # Convert absolute index to numeric slot (count year-like cells before it)
-            slot = sum(1 for i, _ in year_cells if i < best_abs)
+            # Count non-skip cells before best_abs (same logic as _value_at_slot)
+            slot = sum(
+                1 for i, c in enumerate(cells[1:], start=1)
+                if i < best_abs and not _SKIP_CELLS.match(c) and _first_number(c) is not None
+            )
             return slot
     return None
 
@@ -369,12 +376,12 @@ def _value_at_slot(cells: list[str], slot: int) -> float | None:
         val = _first_number(cell)
         if val is not None:
             if current_slot == slot:
-                return val if val != 0 else None
+                return val  # zero is a valid financial metric (e.g. breakeven)
             current_slot += 1
-    # Fallback: first non-zero number
+    # Fallback: first number in the row (including zero)
     for cell in cells[1:]:
         val = _first_number(cell)
-        if val is not None and val != 0:
+        if val is not None:
             return val
     return None
 

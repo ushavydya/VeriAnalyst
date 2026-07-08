@@ -43,6 +43,7 @@ async def fetch_trends(
             langfuse=langfuse,
             trace_context=tc,
             gateway=gateway,
+            xbrl_metrics=filing.xbrl_metrics,
         )
         results.append(YearlyMetrics(
             filed_date=filing.filed_date,

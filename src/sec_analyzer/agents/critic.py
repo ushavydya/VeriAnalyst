@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 
 from langfuse import Langfuse
@@ -52,9 +51,10 @@ def _rule_checks(metrics: dict[str, object]) -> list[str]:
             issues.append("Gross profit exceeds revenue — impossible")
 
     if "net_income" in m and "revenue" in m:
-        # Net income > revenue is theoretically possible via one-time gains but very rare
-        if abs(m["net_income"]) > m["revenue"] * 2:
-            issues.append("Net income magnitude is more than 2× revenue — verify extraction")
+        # Net income above 75% of revenue is a strong signal of extraction error;
+        # even exceptional businesses (e.g. NVDA at ~55%) stay below this bound
+        if abs(m["net_income"]) > m["revenue"] * 0.75:
+            issues.append("Net income magnitude exceeds 75% of revenue — verify extraction")
 
     if "eps_diluted" in m and "eps_basic" in m:
         # Diluted EPS is always ≤ basic EPS in magnitude (more shares = lower per-share)
@@ -91,12 +91,14 @@ def _build_summary_prompt(data: ExtractedData, rule_issues: list[str]) -> str:
 
 def _confidence_from_rules(rule_issues: list[str], metrics: dict) -> float:
     """Derive a confidence score purely from rule checks and metric completeness."""
-    required = {"revenue", "net_income"}
-    missing = required - metrics.keys()
+    # Filter to numeric values only — mirrors _rule_checks — so None-valued keys
+    # don't inflate the confidence score.
+    numeric_keys = {k for k, v in metrics.items() if isinstance(v, (int, float))}
+    missing = _REQUIRED_METRICS - numeric_keys
 
-    if missing == required:          # nothing extracted at all
+    if missing == _REQUIRED_METRICS:  # nothing extracted at all
         return 0.0
-    if missing:                      # partial extraction
+    if missing:                       # partial extraction
         base = 0.5
     else:
         base = 0.9
@@ -104,25 +106,6 @@ def _confidence_from_rules(rule_issues: list[str], metrics: dict) -> float:
     # Each rule violation knocks 0.15 off
     penalty = min(len(rule_issues) * 0.15, base)
     return round(max(0.0, base - penalty), 2)
-
-
-def _parse_llm_response(text: str) -> tuple[float, list[str], str]:
-    """Return (confidence, issues, summary) from the LLM JSON reply.
-
-    Kept for backward-compatibility with tests.
-    """
-    raw = text.strip()
-    raw = re.sub(r"^```[a-z]*\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw).strip()
-
-    try:
-        data = json.loads(raw)
-        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
-        issues = [str(i) for i in data.get("issues", [])]
-        summary = str(data.get("summary", ""))
-        return confidence, issues, summary
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return 0.5, ["LLM returned unparseable critique"], "Could not parse LLM response."
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

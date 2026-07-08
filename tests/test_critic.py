@@ -1,12 +1,11 @@
 """Tests for the critic agent (mocked — no real LLM calls)."""
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from sec_analyzer.agents.critic import Critique, _parse_llm_response, _rule_checks, critique
+from sec_analyzer.agents.critic import Critique, _rule_checks, critique
 from sec_analyzer.agents.extractor import ExtractedData
 from sec_analyzer.gateway.base import ModelResponse
 
@@ -53,36 +52,30 @@ def test_rule_checks_balance_sheet_mismatch():
     assert any("balance" in i.lower() for i in issues)
 
 
-# ── _parse_llm_response ───────────────────────────────────────────────────────
+# ── net_income threshold (tightened to 75% of revenue) ───────────────────────
 
-def test_parse_llm_response_valid():
-    payload = json.dumps({
-        "confidence": 0.85,
-        "issues": ["Revenue figure seems slightly low vs prior year"],
-        "summary": "Extraction looks mostly accurate.",
-    })
-    conf, issues, summary = _parse_llm_response(payload)
-    assert conf == 0.85
-    assert len(issues) == 1
-    assert "accurate" in summary
+def test_rule_checks_net_income_exceeds_75pct_revenue():
+    # 80% net margin should fire
+    issues = _rule_checks({"revenue": 100.0, "net_income": 80.0})
+    assert any("75%" in i for i in issues)
 
 
-def test_parse_llm_response_clamps_confidence():
-    payload = json.dumps({"confidence": 1.5, "issues": [], "summary": "Great."})
-    conf, _, _ = _parse_llm_response(payload)
-    assert conf == 1.0
+def test_rule_checks_net_income_below_75pct_passes():
+    # 74% net margin is high but should not fire
+    issues = _rule_checks({"revenue": 100.0, "net_income": 74.0})
+    assert not any("75%" in i for i in issues)
 
 
-def test_parse_llm_response_strips_fences():
-    payload = "```json\n{\"confidence\": 0.9, \"issues\": [], \"summary\": \"OK\"}\n```"
-    conf, issues, summary = _parse_llm_response(payload)
-    assert conf == 0.9
+def test_rule_checks_large_loss_fires():
+    # Large losses (negative net income > 75% of revenue) should also fire
+    issues = _rule_checks({"revenue": 100.0, "net_income": -80.0})
+    assert any("75%" in i for i in issues)
 
 
-def test_parse_llm_response_bad_json_returns_defaults():
-    conf, issues, _ = _parse_llm_response("I cannot provide that.")
-    assert conf == 0.5
-    assert issues  # contains a "unparseable" notice
+def test_rule_checks_nvda_like_margins_pass():
+    # NVDA FY2026: net_income=120067, revenue=215938 → 55.6% margin → should NOT flag
+    issues = _rule_checks({"revenue": 215938.0, "net_income": 120067.0})
+    assert not any("75%" in i for i in issues)
 
 
 # ── critique (integration, mocked gateway) ───────────────────────────────────

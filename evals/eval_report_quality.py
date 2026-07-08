@@ -86,6 +86,7 @@ async def _eval_report(ticker: str, langfuse: Langfuse, trace_id: str) -> dict:
             document_text=filing.read_text(),
             langfuse=langfuse,
             trace_context=tc,
+            xbrl_metrics=filing.xbrl_metrics,
         )
         crit = await critique(data, langfuse=langfuse, trace_context=tc)
         report = await write_report(data, crit, langfuse=langfuse, trace_context=tc)

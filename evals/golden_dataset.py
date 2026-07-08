@@ -57,6 +57,36 @@ GOLDEN: list[GoldenRecord] = [
             "eps_diluted":        4.73,
         },
     ),
+    GoldenRecord(
+        ticker="NVDA",
+        fiscal_year_end="2026",  # FY ended January 25, 2026
+        metrics={
+            "revenue":       215938.0,
+            "net_income":    120067.0,
+            "eps_diluted":       4.90,
+            "total_assets":  206803.0,
+        },
+    ),
+    GoldenRecord(
+        ticker="AMD",
+        fiscal_year_end="2025",  # FY ended December 27, 2025
+        metrics={
+            "revenue":        34639.0,
+            "net_income":      4335.0,
+            "eps_diluted":       2.65,
+            "total_assets":   76926.0,
+        },
+    ),
+    GoldenRecord(
+        ticker="JPM",
+        fiscal_year_end="2025",  # FY ended December 31, 2025
+        metrics={
+            "revenue":       182447.0,
+            "net_income":     57048.0,
+            "eps_diluted":      20.02,
+            "total_assets": 4424900.0,
+        },
+    ),
 ]
 
 
@@ -87,13 +117,14 @@ async def _refresh() -> None:
         tc = TraceContext(trace_id=uuid.uuid4().hex)
 
         for record in GOLDEN:
-            cik = await cache.get_cik(record.ticker)
-            if not cik:
-                # Resolve CIK via submissions endpoint
-                filing = await retriever.fetch_10k(record.ticker, tc)
-                cik = filing.cik
-
-            xbrl = await retriever.fetch_xbrl(cik, record.fiscal_year_end, tc)
+            # fetch_10k resolves CIK and returns the latest accession — use
+            # the real accession as the XBRL cache key, and pass fiscal_year_end
+            # as the year filter so we compare the right filing year.
+            filing = await retriever.fetch_10k(record.ticker, tc)
+            xbrl = await retriever.fetch_xbrl(
+                filing.cik, filing.accession_number, tc,
+                fiscal_year=record.fiscal_year_end,
+            )
 
             for field_name, golden_val in record.metrics.items():
                 xbrl_val = xbrl.get(field_name)

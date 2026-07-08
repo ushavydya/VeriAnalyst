@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -49,11 +50,11 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 
 CREATE TABLE IF NOT EXISTS xbrl_facts (
-    cik            TEXT NOT NULL,
-    fiscal_year    TEXT NOT NULL,
-    facts_json     TEXT NOT NULL,
-    cached_at      TEXT NOT NULL,
-    PRIMARY KEY (cik, fiscal_year)
+    cik              TEXT NOT NULL,
+    accession_number TEXT NOT NULL,
+    facts_json       TEXT NOT NULL,
+    cached_at        TEXT NOT NULL,
+    PRIMARY KEY (cik, accession_number)
 );
 """
 
@@ -112,22 +113,24 @@ class SQLiteCache:
     # ── Filing metadata ───────────────────────────────────────────────────────
 
     async def get_filing(self, ticker: str, form_type: str = "10-K") -> CachedFiling | None:
-        """Return the most recently filed cached filing for (ticker, form_type)."""
+        """Return the most recently filed cached filing for (ticker, form_type).
+
+        Returns None if no filing found, or if the document file is missing
+        from the documents table.
+        """
         assert self._conn
         async with self._conn.execute(
             """SELECT f.ticker, f.cik, f.accession_number, f.form_type,
                       f.filed_date, f.document_url, d.file_path
                FROM filings f
-               LEFT JOIN documents d ON d.url = f.document_url
+               JOIN documents d ON d.url = f.document_url
                WHERE f.ticker = ? AND f.form_type = ?
                ORDER BY f.filed_date DESC
                LIMIT 1""",
             (ticker.upper(), form_type),
         ) as cur:
             row = await cur.fetchone()
-            if not row:
-                return None
-            return CachedFiling(**dict(row))
+            return CachedFiling(**dict(row)) if row else None
 
     async def store_filing(
         self,
@@ -153,7 +156,7 @@ class SQLiteCache:
         )
         await self._conn.commit()
 
-    # ── Document file path ─────────────────────────────────────────────────────
+    # ── Document file path ────────────────────────────────────────────────────
 
     async def get_document_path(self, url: str) -> str | None:
         assert self._conn
@@ -163,32 +166,31 @@ class SQLiteCache:
             row = await cur.fetchone()
             return row["file_path"] if row else None
 
-    # ── XBRL facts ────────────────────────────────────────────────────────────
-
-    async def get_xbrl_facts(self, cik: str, fiscal_year: str) -> dict | None:
-        assert self._conn
-        import json as _json
-        async with self._conn.execute(
-            "SELECT facts_json FROM xbrl_facts WHERE cik = ? AND fiscal_year = ?",
-            (cik, fiscal_year),
-        ) as cur:
-            row = await cur.fetchone()
-            return _json.loads(row["facts_json"]) if row else None
-
-    async def store_xbrl_facts(self, cik: str, fiscal_year: str, facts: dict) -> None:
-        assert self._conn
-        import json as _json
-        await self._conn.execute(
-            """INSERT OR REPLACE INTO xbrl_facts (cik, fiscal_year, facts_json, cached_at)
-               VALUES (?, ?, ?, ?)""",
-            (cik, fiscal_year, _json.dumps(facts), _now()),
-        )
-        await self._conn.commit()
-
     def document_path_for(self, url: str) -> Path:
         """Return a deterministic filesystem path for caching a URL."""
         digest = hashlib.sha256(url.encode()).hexdigest()[:16]
         return self._docs_dir / f"{digest}.txt"
+
+    # ── XBRL facts ────────────────────────────────────────────────────────────
+
+    async def get_xbrl_facts(self, cik: str, accession_number: str) -> dict | None:
+        assert self._conn
+        async with self._conn.execute(
+            "SELECT facts_json FROM xbrl_facts WHERE cik = ? AND accession_number = ?",
+            (cik, accession_number),
+        ) as cur:
+            row = await cur.fetchone()
+            return json.loads(row["facts_json"]) if row else None
+
+    async def store_xbrl_facts(self, cik: str, accession_number: str, facts: dict) -> None:
+        assert self._conn
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO xbrl_facts
+               (cik, accession_number, facts_json, cached_at)
+               VALUES (?, ?, ?, ?)""",
+            (cik, accession_number, json.dumps(facts), _now()),
+        )
+        await self._conn.commit()
 
 
 def _now() -> str:
